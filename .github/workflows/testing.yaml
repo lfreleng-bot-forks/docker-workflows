@@ -625,6 +625,70 @@ jobs:
       harden_runner_supplemental_unpinned: true
       harden_runner_extra_endpoints: 'github.com:443'
 
+  # The packed format end to end. build-artifact-action packs
+  # hello.txt, and the verify lane takes the artefact ID and digest it
+  # reports: it creates target/ below the same fixture and unpacks the
+  # artefact there by ID, pinned to that digest, without the raw
+  # placement steps. The text differs from the raw leg's, so
+  # test_command proves this artefact reached the image.
+  build-artifacts-pack:
+    name: 'Build artefact pack'
+    permissions: {}
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 5
+    outputs:
+      artifact_id: ${{ steps.pack.outputs.artifact-id }}
+      digest: ${{ steps.pack.outputs.digest }}
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@65ff87957e1cac2de3203a85dbb07c31810321cb  # v0.16.4
+        with:
+          config: '@6e6cab073a93c0d58e4e8846d44e1cbddbac975b'  # v0.21.0
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+      - name: 'Create the build artefact'
+        shell: bash
+        run: |
+          mkdir -p build-artifacts-packed
+          echo 'hello from a packed build artefact' \
+            > build-artifacts-packed/hello.txt
+      - name: 'Pack the build artefact'
+        id: pack
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/build-artifact-action@d2443b3437d685ffda8ab886db89d891a6c34af0  # v0.1.3
+        with:
+          mode: 'pack'
+          artifact-name: 'build-artifacts-packed'
+          path: 'build-artifacts-packed'
+
+  build-artifacts-packed:
+    name: 'Build/Test (packed build artefacts)'
+    needs: 'build-artifacts-pack'
+    permissions:
+      contents: read
+      pull-requests: read  # repository-metadata-action queries PR data
+    uses: $/.github/workflows/build-test.yaml
+    with:
+      path_prefix: 'tests/fixtures/build-artifacts'
+      images: '[{"name": "build-artifacts-packed", "context": "."}]'
+      build_artifacts: >-
+        [{"name": "build-artifacts-packed",
+          "id": "${{ needs.build-artifacts-pack.outputs.artifact_id }}",
+          "digest": "${{ needs.build-artifacts-pack.outputs.digest }}",
+          "path": "target"}]
+      build_timeout_minutes: 5
+      test_command: >-
+        test "$(docker run --rm build-artifacts-packed:verify
+        cat /hello.txt)" = 'hello from a packed build artefact'
+      lint_enabled: false
+      sbom_enabled: false
+      grype_enabled: false
+
   # The Java-to-Docker hand-off end to end, through both families'
   # real contract. The Java lane runs a real Maven build of
   # test-maven-project and uploads the reactor artefact, which keeps
@@ -1594,11 +1658,13 @@ jobs:
       - name: 'Test the dependency-change gate wiring and the action'
         run: bash tests/test_dependency_change.sh
 
-  # build_artifacts in every lane: the input and its three build-job
-  # steps compared across the lanes, then the validate and place step
-  # scripts, extracted from each workflow, run against valid input,
-  # every malformed entry, missing artefacts and artefacts that would
-  # overwrite the checkout.
+  # build_artifacts in every lane: the input and its build-job steps
+  # compared across the lanes, the packed entries' unpack steps
+  # checked for same-run, add-only use of build-artifact-action, then
+  # the validate, place and prepare step scripts, extracted from each
+  # workflow, run against valid raw and packed input, every malformed
+  # entry, missing artefacts and artefacts that would overwrite the
+  # checkout.
   build-artifacts-checks:
     name: 'Build artefact checks'
     permissions:
