@@ -100,7 +100,10 @@ on:
           workflow run uploaded, placed in the checkout before the
           images build: [{"name": "<artefact>", "path": "<dir>"}].
           path is optional, defaults to '.' and is relative to
-          path_prefix. Only same-run artefacts qualify, so the
+          path_prefix. An entry with an 'id' (and optional 'digest')
+          names an artefact build-artifact-action packed, unpacked
+          by ID and checked against the digest; at most four entries
+          may carry one. Only same-run artefacts qualify, so the
           calling job must 'needs:' the job that uploads them. A file
           the checkout already holds fails the build: artefacts add
           to the source tree and never replace it. Empty (the
@@ -1361,7 +1364,10 @@ jobs:
       # only, staged outside the checkout; and placement refuses any
       # file the checkout already holds, so an artefact adds to the
       # source tree but never replaces a Dockerfile or script. Unset
-      # or '[]', none of these steps runs.
+      # or '[]', none of these steps runs. An entry without an 'id'
+      # is a raw artefact, downloaded and placed by the steps below;
+      # one with an 'id' was packed by build-artifact-action, whose
+      # unpack steps further down add it to the checkout instead.
       - name: 'Validate build_artifacts'
         id: build-artifacts
         # yamllint disable-line rule:line-length
@@ -1372,8 +1378,9 @@ jobs:
           PATH_PREFIX: ${{ inputs.path_prefix }}
         run: |
           # Check every entry before anything downloads, then hand the
-          # download steps their names and the place step a normalised
-          # plan. Paths resolve against the checkout, so a symlink cannot
+          # download steps their names, the place step a normalised plan
+          # of the raw entries and the unpack steps one packed entry each.
+          # Paths resolve against the checkout, so a symlink cannot
           # carry one outside path_prefix.
           plan="${RUNNER_TEMP}/build-artifacts.json"
           if [[ -z "${BUILD_ARTIFACTS//[[:space:]]/}" ]]; then
@@ -1395,6 +1402,8 @@ jobs:
             exit 0
           fi
           errors=0
+          declare -A raw=() packed=()
+          slots=()
           for ((i = 0; i < count; i++)); do
             entry=$(jq -c --argjson i "${i}" '.[$i]' <<< "${BUILD_ARTIFACTS}")
             label="build_artifacts[${i}] ${entry}"
@@ -1457,23 +1466,100 @@ jobs:
               errors=$((errors + 1))
               continue
             fi
+            # An 'id' (empty counts as none) marks a packed artefact
+            if ! jq -e '.id == null or .id == "" or
+              (.id | type == "number" and . >= 1 and . == floor) or
+              (.id | type == "string" and test("\\A[1-9][0-9]*\\z"))' \
+              > /dev/null <<< "${entry}"; then
+              echo "::error::${label}: 'id' must be a positive integer" \
+                "artefact ID"
+              errors=$((errors + 1))
+              continue
+            fi
+            if ! jq -e '.digest == null or .digest == "" or
+              (.digest | type == "string" and test("\\A[0-9a-f]{64}\\z"))' \
+              > /dev/null <<< "${entry}"; then
+              echo "::error::${label}: 'digest' must be a SHA-256 of" \
+                "64 lower-case hex characters"
+              errors=$((errors + 1))
+              continue
+            fi
+            id=$(jq -r '.id // "" | tostring' <<< "${entry}")
+            digest=$(jq -r '.digest // ""' <<< "${entry}")
+            if [ -z "${id}" ]; then
+              if [ -n "${digest}" ]; then
+                echo "::error::${label}: 'digest' needs an 'id'"
+                errors=$((errors + 1))
+                continue
+              fi
+              raw["${name}"]=1
+              continue
+            fi
+            # build-artifact-action unpacks only into a directory named
+            # by these segments, with no symlink below the workspace
+            dest=$(realpath -m -s --relative-to=. -- "${PATH_PREFIX}/${path}")
+            if [[ ! "${dest}" =~ ^(\.|[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*)$ ]] ||
+              [[ "/${dest}/" == */../* ]]; then
+              echo "::error::${label}: an entry with an 'id' unpacks into" \
+                "'${dest}', which must be '.' or segments of A-Z, a-z," \
+                "0-9, '.', '_' and '-' inside the workspace"
+              errors=$((errors + 1))
+              continue
+            fi
+            part=''
+            IFS=/ read -r -a segments <<< "${dest}"
+            for segment in "${segments[@]}"; do
+              part="${part:+${part}/}${segment}"
+              if [ -L "${part}" ] || { [ -e "${part}" ] && [ ! -d "${part}" ]; }
+              then
+                echo "::error::${label}: '${part}' in the checkout is not a" \
+                  "directory; an entry with an 'id' unpacks into directories" \
+                  "only, never through a symlink"
+                errors=$((errors + 1))
+                continue 2
+              fi
+            done
+            packed["${name}"]=1
+            slots+=("${name}" "${id}" "${digest}" "${dest}")
           done
+          for name in "${!packed[@]}"; do
+            if [ -n "${raw[${name}]:-}" ]; then
+              echo "::error::build_artifacts: '${name}' appears both with" \
+                "and without an 'id'; one artefact has one format"
+              errors=$((errors + 1))
+            fi
+          done
+          if [ "${#slots[@]}" -gt $((4 * 4)) ]; then
+            echo "::error::build_artifacts: at most 4 entries may carry an" \
+              "'id', found $((${#slots[@]} / 4))"
+            errors=$((errors + 1))
+          fi
           if [ "${errors}" -gt 0 ]; then
             exit 1
           fi
-          jq -c '[.[] | {name,
+          jq -c '[.[] | select((.id // "" | tostring) == "") | {name,
             path: (if (.path // "") == "" then "." else .path end)}]' \
             <<< "${BUILD_ARTIFACTS}" > "${plan}"
           # The first name downloads by name, which proves it exists. Two
           # or more also download as a brace set, which download-artifact's
           # minimatch expands to the exact names
-          first=$(jq -r '[.[].name] | unique | .[0]' "${plan}")
+          first=$(jq -r '[.[].name] | unique | .[0] // ""' "${plan}")
           pattern=$(jq -r '[.[].name] | unique
-            | if length == 1 then "" else "{" + join(",") + "}" end' \
+            | if length < 2 then "" else "{" + join(",") + "}" end' \
             "${plan}")
           printf 'first=%s\npattern=%s\n' "${first}" "${pattern}" \
             >> "${GITHUB_OUTPUT}"
-          echo "build_artifacts: $(jq length "${plan}") entr(y/ies) valid ✅"
+          # One fixed unpack step per slot, as a job cannot loop over steps
+          for ((i = 0; i < ${#slots[@]} / 4; i++)); do
+            printf 'packed_%d_%s=%s\n' \
+              $((i + 1)) name "${slots[i * 4]}" \
+              $((i + 1)) id "${slots[i * 4 + 1]}" \
+              $((i + 1)) digest "${slots[i * 4 + 2]}" \
+              $((i + 1)) destination "${slots[i * 4 + 3]}" \
+              >> "${GITHUB_OUTPUT}"
+          done
+          echo "build_artifacts: $(jq length <<< "${BUILD_ARTIFACTS}")" \
+            "entr(y/ies) valid ✅"
       # A missing artefact fails this download; the place step reports
       # it with the same-run rule, so the job does not stop here
       - name: 'Download build artifacts'
@@ -1625,6 +1711,88 @@ jobs:
           done
           echo "Placed ${#sources[@]} build artefact file(s) under" \
             "${PATH_PREFIX} ✅"
+      # overlay needs each destination to exist; validation has checked
+      # none is a file or a symlink, and raw placement adds only files
+      - name: 'Create packed build artifact destinations'
+        id: prepare-packed-build-artifacts
+        if: steps.build-artifacts.outputs.packed_1_name != ''
+        shell: bash
+        env:
+          DESTINATIONS: >-
+            ${{ steps.build-artifacts.outputs.packed_1_destination }}
+            ${{ steps.build-artifacts.outputs.packed_2_destination }}
+            ${{ steps.build-artifacts.outputs.packed_3_destination }}
+            ${{ steps.build-artifacts.outputs.packed_4_destination }}
+        run: |
+          # Validated as segments of [A-Za-z0-9._-], so a space splits them
+          read -r -a destinations <<< "${DESTINATIONS}"
+          for dest in "${destinations[@]}"; do
+            if ! mkdir -p -- "${dest}"; then
+              echo "::error::build_artifacts: cannot create '${dest}' for a" \
+                "packed artefact; a raw artefact placed a file in its way"
+              exit 1
+            fi
+          done
+      # Packed artefacts: build-artifact-action downloads this run's
+      # artefact by ID with no token, refuses one whose manifest names
+      # another run or fails 'digest', and with overlay adds files to
+      # the checkout, failing on any path that already exists
+      - name: 'Unpack packed build artifact 1'
+        id: unpack-build-artifact-1
+        if: steps.build-artifacts.outputs.packed_1_name != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/build-artifact-action@d2443b3437d685ffda8ab886db89d891a6c34af0  # v0.1.3
+        with:
+          mode: 'unpack'
+          artifact-name: ${{ steps.build-artifacts.outputs.packed_1_name }}
+          artifact-id: ${{ steps.build-artifacts.outputs.packed_1_id }}
+          # yamllint disable-line rule:line-length
+          expected-digest: ${{ steps.build-artifacts.outputs.packed_1_digest }}
+          # yamllint disable-line rule:line-length
+          destination: ${{ steps.build-artifacts.outputs.packed_1_destination }}
+          overlay: 'true'
+      - name: 'Unpack packed build artifact 2'
+        id: unpack-build-artifact-2
+        if: steps.build-artifacts.outputs.packed_2_name != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/build-artifact-action@d2443b3437d685ffda8ab886db89d891a6c34af0  # v0.1.3
+        with:
+          mode: 'unpack'
+          artifact-name: ${{ steps.build-artifacts.outputs.packed_2_name }}
+          artifact-id: ${{ steps.build-artifacts.outputs.packed_2_id }}
+          # yamllint disable-line rule:line-length
+          expected-digest: ${{ steps.build-artifacts.outputs.packed_2_digest }}
+          # yamllint disable-line rule:line-length
+          destination: ${{ steps.build-artifacts.outputs.packed_2_destination }}
+          overlay: 'true'
+      - name: 'Unpack packed build artifact 3'
+        id: unpack-build-artifact-3
+        if: steps.build-artifacts.outputs.packed_3_name != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/build-artifact-action@d2443b3437d685ffda8ab886db89d891a6c34af0  # v0.1.3
+        with:
+          mode: 'unpack'
+          artifact-name: ${{ steps.build-artifacts.outputs.packed_3_name }}
+          artifact-id: ${{ steps.build-artifacts.outputs.packed_3_id }}
+          # yamllint disable-line rule:line-length
+          expected-digest: ${{ steps.build-artifacts.outputs.packed_3_digest }}
+          # yamllint disable-line rule:line-length
+          destination: ${{ steps.build-artifacts.outputs.packed_3_destination }}
+          overlay: 'true'
+      - name: 'Unpack packed build artifact 4'
+        id: unpack-build-artifact-4
+        if: steps.build-artifacts.outputs.packed_4_name != ''
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/build-artifact-action@d2443b3437d685ffda8ab886db89d891a6c34af0  # v0.1.3
+        with:
+          mode: 'unpack'
+          artifact-name: ${{ steps.build-artifacts.outputs.packed_4_name }}
+          artifact-id: ${{ steps.build-artifacts.outputs.packed_4_id }}
+          # yamllint disable-line rule:line-length
+          expected-digest: ${{ steps.build-artifacts.outputs.packed_4_digest }}
+          # yamllint disable-line rule:line-length
+          destination: ${{ steps.build-artifacts.outputs.packed_4_destination }}
+          overlay: 'true'
 
       # Builds each image, in order, into the daemon as
       # [<namespace>/]<name>:verify (plus the plain <name>:verify
