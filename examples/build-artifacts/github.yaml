@@ -67,3 +67,11 @@ jobs:
       # fails the build: artefacts add to the source tree, never replace it.
       # yamllint disable-line rule:line-length
       build_artifacts: '[{"name": "${{ needs.maven-build-test.outputs.build_artifact_name }}"}]'
+      # A Java lane that packs its output with build-artifact-action
+      # reports the artefact's ID and digest too; pass them and the lane
+      # unpacks the artefact by ID, checked against that digest:
+      # build_artifacts: >-
+      #   [{"name": "${{ needs.maven-build-test.outputs.build_artifact_name }}",
+      #     "id": "${{ needs.maven-build-test.outputs.build_artifact_id }}",
+      #     "digest":
+      #       "${{ needs.maven-build-test.outputs.build_artifact_digest }}"}]

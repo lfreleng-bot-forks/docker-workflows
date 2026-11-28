@@ -473,17 +473,61 @@ unless every file passes. The build job alone downloads them:
 discovery, Dockerfile lint, the tests, SBOM and scan jobs read the
 source, where Dockerfiles live, or the built images.
 
+### Packed artefacts
+
+An entry may also carry an `id` and a `digest`: the `artifact-id` and
+`digest` outputs of
+[`build-artifact-action`](https://github.com/lfreleng-actions/build-artifact-action)
+in `pack` mode, which uploads a tar and a digest manifest rather than
+the files themselves. An entry with an `id` names such a packed
+artefact; one without, or with an empty `id`, names a raw artefact
+and the lane reads it as above. One artefact has one format, so a
+`name` may not appear both with and without an `id`.
+
+```yaml
+    with:
+      build_artifacts: >-
+        [{"name": "app-jars",
+          "id": "${{ needs.build.outputs.artifact-id }}",
+          "digest": "${{ needs.build.outputs.digest }}"}]
+```
+
+The build job unpacks each packed entry with `build-artifact-action`
+in `unpack` mode, with `overlay: 'true'`, into
+`<path_prefix>/<path>`, creating that directory first when the
+checkout lacks it. The action downloads this run's artefact by ID,
+with no token, refuses a manifest that names another run, extracts
+nothing unless the manifest hashes to `digest` (when given) and
+matches the tar, and fails on any file that already exists, the
+checkout's or one an earlier entry added. The raw placement steps
+never touch a packed entry. The build job also fails before anything
+downloads when:
+
+- `id` is not a positive integer, as a number or a string of digits;
+- `digest` is not 64 lower-case hex characters, or comes without an
+  `id`;
+- `<path_prefix>/<path>` is not `.` or segments of `[A-Za-z0-9._-]`,
+  the form the action accepts, or passes through a file or a
+  symlink in the checkout;
+- more than four entries carry an `id`: the job has four fixed
+  unpack steps, as a job cannot loop over steps.
+
+Each unpack adds its whole artefact or nothing, but entries unpack
+one after another: when a later one fails, the files of earlier
+entries stay in the checkout, and the job fails before any image
+builds.
+
 `java-workflows` (v0.7.0 or later) uploads its packaged output with
 `upload_build_artifacts: true`, and reports the artefact as the
 `build_artifact_name`, `build_artifact_shape` and
-`build_artifact_count` outputs. Its `reactor` shape keeps each
+`build_artifact_count` outputs, as a raw artefact. Its `reactor` shape keeps each
 packaged file at its module-relative path below `path_prefix`
 (`app/target/app-1.0.jar`), so the default `path` of `.` puts every
 jar where its module's Dockerfile expects it, when both lanes share a
 `path_prefix`. The `m2repo` shape, a Maven repository tree a deploy
 phase wrote, does not map onto module paths; guard the Docker job on
 `build_artifact_shape == 'reactor'`. `examples/build-artifacts/` shows
-the whole caller.
+the whole caller, in a GitHub and a Gerrit form.
 
 ## Image Namespace
 
@@ -1332,11 +1376,15 @@ against the action to show both read the same recipes.
 `build_artifacts` runs end to end too: one job uploads
 `target/hello.txt`, and a `build-test.yaml` call that `needs:` it
 builds `tests/fixtures/build-artifacts/`, whose Dockerfile copies
-that file, then reads it back out of the image in `test_command`.
+that file, then reads it back out of the image in `test_command`. A
+second pair does the same with a packed artefact:
+`build-artifact-action` packs `hello.txt`, and the lane call passes
+the `id` and `digest` it reports, with a `path` of `target`.
 `tests/test_build_artifacts.sh` checks the three lanes define the
-input and its steps alike, and runs the validation and placement
-step scripts from each lane against every failure case and the no-op
-inputs.
+input and its steps alike, checks each unpack step passes no run ID
+or token and unpacks with `overlay`, and runs the validation,
+placement and prepare step scripts from each lane against every
+failure case and the no-op inputs.
 
 The same `build_artifacts` call, in block mode, also passes the
 three allow-list extension inputs: the organisation's own list as an

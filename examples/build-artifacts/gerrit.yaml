@@ -1,0 +1,192 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# =============================================================================
+# EXAMPLE: Gerrit-wrapped caller building images from a Java lane's artefacts
+# =============================================================================
+# The Gerrit form of examples/build-artifacts/github.yaml, which explains
+# the artifact-first pattern. Both lanes check out the same Gerrit change,
+# and the Docker job must `needs:` the Java job: build_artifacts only
+# reaches artefacts uploaded earlier in the SAME workflow run. Deploy it
+# as examples/build-test/gerrit.yaml describes (a 'gerrit-verify' name).
+# =============================================================================
+name: 'Gerrit Verify'
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+    inputs:
+      GERRIT_BRANCH:
+        description: 'Branch that change is against'
+        required: false
+        type: string
+        default: ''
+      GERRIT_CHANGE_ID:
+        description: 'The ID for the change'
+        required: false
+        type: string
+        default: ''
+      GERRIT_CHANGE_NUMBER:
+        description: 'The Gerrit number'
+        required: false
+        type: string
+        default: ''
+      GERRIT_CHANGE_URL:
+        description: 'URL to the change'
+        required: false
+        type: string
+        default: ''
+      GERRIT_EVENT_TYPE:
+        description: 'Type of Gerrit event'
+        required: false
+        type: string
+        default: ''
+      GERRIT_PATCHSET_NUMBER:
+        description: 'The patch number for the change'
+        required: false
+        type: string
+        default: ''
+      GERRIT_PATCHSET_REVISION:
+        description: 'The revision sha'
+        required: false
+        type: string
+        default: ''
+      GERRIT_PROJECT:
+        description: 'Project in Gerrit'
+        required: false
+        type: string
+        default: ''
+      GERRIT_REFSPEC:
+        description: 'Gerrit refspec of change'
+        required: false
+        type: string
+        default: ''
+      GERRIT_DISABLED:
+        description: 'Run without Gerrit components'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.event.inputs.GERRIT_CHANGE_ID || github.run_id }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  # Clear any previous Verified vote so the change starts from a clean state.
+  clear-vote:
+    if: inputs.GERRIT_DISABLED != true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a  # v2.22.4
+        with:
+          egress-policy: audit
+      - name: 'Clear votes'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/gerrit-review-action@31093af31cec3755c34d8563ee54e2b7eb3a4eac  # v1.3.1
+        with:
+          host: ${{ vars.GERRIT_SERVER }}
+          username: ${{ vars.GERRIT_SSH_USER }}
+          key: ${{ secrets.GERRIT_SSH_PRIVKEY }}
+          known_hosts: ${{ vars.GERRIT_KNOWN_HOSTS }}
+          gerrit-change-number: ${{ inputs.GERRIT_CHANGE_NUMBER }}
+          gerrit-patchset-number: ${{ inputs.GERRIT_PATCHSET_NUMBER }}
+          vote-type: clear
+      - name: 'Allow replication'
+        run: sleep 10s
+
+  # Keeps the packaged jars as a workflow artefact for the Docker job
+  maven-build-test:
+    name: 'Maven Build/Test'
+    needs: clear-vote
+    if: >-
+      always()
+      && (needs.clear-vote.result == 'success'
+          || needs.clear-vote.result == 'skipped')
+    permissions:
+      contents: read
+      pull-requests: read  # repository-metadata-action queries PR data
+    # yamllint disable-line rule:line-length
+    uses: lfreleng-actions/java-workflows/.github/workflows/maven-build-test.yaml@535e49d8407dc4dbca224c8f389716208fbee155  # v0.8.1
+    with:
+      # yamllint disable-line rule:line-length
+      gerrit_refspec: ${{ !inputs.GERRIT_DISABLED && inputs.GERRIT_REFSPEC || '' }}
+      # yamllint disable-line rule:line-length
+      gerrit_project: ${{ !inputs.GERRIT_DISABLED && inputs.GERRIT_PROJECT || '' }}
+      # yamllint disable-line rule:line-length
+      gerrit_branch: ${{ !inputs.GERRIT_DISABLED && inputs.GERRIT_BRANCH || '' }}
+      upload_build_artifacts: true
+
+  # Only the 'reactor' shape maps jars onto module paths (not 'm2repo')
+  docker-build-test:
+    name: 'Docker Build/Test'
+    needs: maven-build-test
+    if: >-
+      always()
+      && needs.maven-build-test.result == 'success'
+      && needs.maven-build-test.outputs.build_artifact_shape == 'reactor'
+    permissions:
+      contents: read
+      pull-requests: read  # repository-metadata-action queries PR data
+    # REPLACE the pinned SHA below with a docker-workflows release SHA.
+    # The all-zero SHA is a non-functional placeholder, NOT a real commit.
+    # yamllint disable-line rule:line-length
+    uses: lfreleng-actions/docker-workflows/.github/workflows/build-test.yaml@0000000000000000000000000000000000000000  # REPLACE: vX.Y.Z
+    with:
+      # yamllint disable-line rule:line-length
+      gerrit_refspec: ${{ !inputs.GERRIT_DISABLED && inputs.GERRIT_REFSPEC || '' }}
+      # yamllint disable-line rule:line-length
+      gerrit_project: ${{ !inputs.GERRIT_DISABLED && inputs.GERRIT_PROJECT || '' }}
+      # yamllint disable-line rule:line-length
+      gerrit_branch: ${{ !inputs.GERRIT_DISABLED && inputs.GERRIT_BRANCH || '' }}
+      # Each entry takes the artefact name and an optional path, relative
+      # to path_prefix (default '.'). A file the checkout already holds
+      # fails the build: artefacts add to the source tree, never replace it.
+      # yamllint disable-line rule:line-length
+      build_artifacts: '[{"name": "${{ needs.maven-build-test.outputs.build_artifact_name }}"}]'
+      # A Java lane that packs its output with build-artifact-action
+      # reports the artefact's ID and digest too; pass them and the lane
+      # unpacks the artefact by ID, checked against that digest:
+      # build_artifacts: >-
+      #   [{"name": "${{ needs.maven-build-test.outputs.build_artifact_name }}",
+      #     "id": "${{ needs.maven-build-test.outputs.build_artifact_id }}",
+      #     "digest":
+      #       "${{ needs.maven-build-test.outputs.build_artifact_digest }}"}]
+
+  # Report the overall workflow conclusion back to Gerrit as a Verified vote.
+  vote:
+    if: ${{ always() && inputs.GERRIT_DISABLED != true }}
+    needs: [clear-vote, maven-build-test, docker-build-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # workflow-conclusion queries the Actions API to list run jobs
+      actions: read
+    timeout-minutes: 5
+    steps:
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a  # v2.22.4
+        with:
+          egress-policy: audit
+      - name: 'Get conclusion'
+        # yamllint disable-line rule:line-length
+        uses: im-open/workflow-conclusion@8eac7f17381a6917bc04fec3e2c92e70ebc37526  # v3.0.0
+      - name: 'Set vote'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/gerrit-review-action@31093af31cec3755c34d8563ee54e2b7eb3a4eac  # v1.3.1
+        with:
+          host: ${{ vars.GERRIT_SERVER }}
+          username: ${{ vars.GERRIT_SSH_USER }}
+          key: ${{ secrets.GERRIT_SSH_PRIVKEY }}
+          known_hosts: ${{ vars.GERRIT_KNOWN_HOSTS }}
+          gerrit-change-number: ${{ inputs.GERRIT_CHANGE_NUMBER }}
+          gerrit-patchset-number: ${{ inputs.GERRIT_PATCHSET_NUMBER }}
+          vote-type: ${{ env.WORKFLOW_CONCLUSION }}
